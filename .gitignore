@@ -1,0 +1,7 @@
+out/
+.vs/
+*.pdb
+*.lib
+*.rlib
+build/
+cargo/
