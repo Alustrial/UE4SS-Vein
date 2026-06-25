@@ -44,6 +44,7 @@
 #include <Unreal/FWorldContext.hpp>
 #include <Unreal/FOutputDevice.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
+#include <Unreal/Core/HAL/UnrealMemory.hpp>  // VeinCF: FMemory::Realloc/Malloc/Free for TSet grow
 #include <Unreal/Hooks.hpp>
 #include <Unreal/PackageName.hpp>
 #include <Unreal/Property/FEnumProperty.hpp>
@@ -358,6 +359,55 @@ static bool veincf_tset_insert(
         reinterpret_cast<uint32_t*>(allocFlags)[num >> 5] |= (1u << (num & 31)); // allocation bit
         *arrayNumAddr     = num + 1;                                    // SparseArray.ArrayNum
         *allocNumBitsAddr = *allocNumBitsAddr + 1;                      // AllocFlags.NumBits
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: GROW a UE TSet's TSparseArray (element Data + AllocationFlags TBitArray) to `newMax` slots
+// using the ENGINE allocator (FMemory) so the engine can keep managing/realloc/free it afterward.
+// For DENSELY-PACKED sets only (FirstFreeIndex == -1) — the inserters above append at ArrayNum, so no
+// free-list fixup is needed; the engine's own future Adds also append into the extra capacity. Crucially
+// migrates an INLINE bitarray (<=128 bits, stored in the struct) to a HEAP buffer, because the inserters
+// write allocation bits THROUGH the SecondaryData pointer (which is null while inline). Leaves
+// ArrayNum/NumBits untouched (the inserter bumps them). Layout relative to `base` (verified on VEIN, same
+// shape for the AssetManager per-type AssetMap and the AssetRegistry CachedAssets):
+//   Data*@+0x00, ArrayNum@+0x08, ArrayMax@+0x0C,
+//   TBitArray{ InlineWords@+0x10 (16B), SecondaryData*@+0x20, NumBits@+0x28, MaxBits@+0x2C }.
+static bool veincf_sparseset_prepare(uintptr_t base, int stride, int32_t curNum, int32_t curMax)
+{
+    __try
+    {
+        int32_t newMax = curMax;
+        // 1) grow element Data (via the engine allocator; Realloc preserves existing elements) if full
+        if (curNum >= curMax)
+        {
+            newMax = curMax + (curMax < 16 ? 16 : curMax);                 // +16 / double
+            void** dataAddr = reinterpret_cast<void**>(base + 0x00);
+            void*  newData  = Unreal::FMemory::Realloc(*dataAddr, (size_t)newMax * (size_t)stride);
+            if (!newData) return false;
+            *dataAddr = newData;
+            *reinterpret_cast<int32_t*>(base + 0x0C) = newMax;             // SparseArray.ArrayMax
+        }
+        // 2) ensure AllocationFlags words are HEAP-backed and cover newMax bits. For a small set the
+        //    TBitArray is INLINE (SecondaryData == null, bits live at base+0x10) — the inserters write
+        //    alloc bits THROUGH SecondaryData, so we must migrate inline -> heap here.
+        void**    secAddr  = reinterpret_cast<void**>(base + 0x20);        // TBitArray SecondaryData ptr
+        int32_t   maxBits  = *reinterpret_cast<int32_t*>(base + 0x2C);
+        int32_t   newWords = (newMax + 31) / 32;
+        if (*secAddr == nullptr || maxBits < newMax)
+        {
+            int32_t   curWords = (curNum + 31) / 32;
+            uint32_t* src = *secAddr ? reinterpret_cast<uint32_t*>(*secAddr)
+                                     : reinterpret_cast<uint32_t*>(base + 0x10);   // inline words
+            uint32_t* dst = reinterpret_cast<uint32_t*>(Unreal::FMemory::Malloc((size_t)newWords * 4));
+            if (!dst) return false;
+            for (int32_t i = 0; i < newWords; ++i) dst[i] = (i < curWords) ? src[i] : 0u;
+            void* oldSec = *secAddr;
+            *secAddr = dst;                                                // SecondaryData -> heap (GetWords uses it)
+            *reinterpret_cast<int32_t*>(base + 0x2C) = newWords * 32;      // TBitArray.MaxBits = heap capacity
+            if (oldSec) Unreal::FMemory::Free(oldSec);                     // free prior heap words (inline isn't freed)
+        }
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -3782,6 +3832,153 @@ Overloads:
             return 1;
         });
 
+        // VeinCF: read a STRUCT VALUE by calling a no-arg getter UFunction and capturing its return-struct
+        // raw bytes (live object-ptr members intact). VEIN's item structs come back from UE4SS's Lua
+        // marshaller as a TABLE that loses the embedded object ptr -> passing it crashes. This grabs the
+        // real bytes in C++ instead, to feed to CallWithStruct. Returns {ptr,size} (heap copy) | nil.
+        // Usage: ReadStructValue(obj, "GetterFnName") -> { ptr=hex, size=int }
+        lua.register_function("ReadStructValue", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (lua.get_stack_size() < 2 || !lua.is_userdata(1)) lua.throw_error("ReadStructValue(obj, getterFn)");
+            lua_State* L = lua.get_lua_state();
+            Unreal::UObject* obj = lua.get_userdata<LuaType::UObject>(1, true).get_remote_cpp_object();
+            const char* fn = lua_tostring(L, 2);
+            if (!obj || !fn) lua.throw_error("ReadStructValue: null arg");
+            std::string s(fn); std::wstring wname(s.begin(), s.end());
+            Unreal::UFunction* func = nullptr;
+            for (Unreal::UClass* cur = obj->GetClassPrivate(); cur; ) {
+                for (auto* f : cur->ForEachFunction()) if (f && f->GetFName().ToString() == wname) { func = f; break; }
+                if (func) break;
+                auto* sup = cur->GetSuperClass(); if (!sup || sup->GetFName().ToString() == STR("Object")) break; cur = sup;
+            }
+            if (!func) lua.throw_error("ReadStructValue: getter not found");
+            uint16_t parmsSize = func->GetParmsSize();
+            std::vector<uint8_t> buffer(parmsSize > 0 ? parmsSize : 1, 0);
+            Unreal::FProperty* retProp = nullptr;
+            for (auto* prop : func->ForEachProperty())
+                if (prop && prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_ReturnParm)) { retProp = prop; break; }
+            if (!retProp) { Output::send(STR("[VeinCF] ReadStructValue: {} has no return value\n"), wname); lua_pushnil(L); return 1; }
+            auto rtype = retProp->GetClass().GetFName().ToString();
+            obj->ProcessEvent(func, buffer.data());          // run the getter; return struct now lives in buffer
+            int32_t off = retProp->GetOffset_Internal();
+            int32_t sz  = retProp->GetSize();
+            if (off < 0 || sz <= 0 || static_cast<size_t>(off + sz) > buffer.size()) { lua_pushnil(L); return 1; }
+            void* heap = malloc(static_cast<size_t>(sz));
+            if (!heap) { lua_pushnil(L); return 1; }
+            memcpy(heap, buffer.data() + off, static_cast<size_t>(sz));   // shallow clone: object-ptr members copied as-is = what we want
+            Output::send(STR("[VeinCF] ReadStructValue: {} -> {} ({} bytes) @ {}\n"), wname, rtype, sz, (uint64_t)(uintptr_t)heap);
+            lua_newtable(L);
+            char pb[32]; snprintf(pb, sizeof(pb), "0x%016llX", (unsigned long long)(uintptr_t)heap);
+            lua_pushstring(L, pb); lua_setfield(L, -2, "ptr");
+            lua_pushinteger(L, sz); lua_setfield(L, -2, "size");
+            lua_pushstring(L, to_string(rtype).c_str()); lua_setfield(L, -2, "structType");
+            return 1;
+        });
+
+        // VeinCF: call a UFunction passing a STRUCT param from a ReadStructValue handle (raw bytes memcpy'd
+        // into the struct param slot) + an optional Name param built in C++. Builds the WHOLE param frame
+        // ourselves and ProcessEvents — UE4SS's Lua marshaller (which crashes on VEIN's item structs) never
+        // touches it. The inventory/interaction crack: use/drop/equip/transfer.
+        // Usage: CallWithStruct(obj, "FnName", structPtrHex, structSize [, nameStr]) -> {ok, structWrote, nameWrote}
+        lua.register_function("CallWithStruct", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (lua.get_stack_size() < 4 || !lua.is_userdata(1))
+                lua.throw_error("CallWithStruct(obj, fn, structPtrHex, structSize[, nameStr])");
+            lua_State* L = lua.get_lua_state();
+            Unreal::UObject* obj = lua.get_userdata<LuaType::UObject>(1, true).get_remote_cpp_object();
+            const char* fn = lua_tostring(L, 2);
+            uintptr_t sp = (uintptr_t)strtoull(lua_tostring(L, 3), nullptr, 16);
+            int32_t structSize = (int32_t)lua_tointeger(L, 4);
+            const char* nameStr = (lua.get_stack_size() >= 5) ? lua_tostring(L, 5) : nullptr;
+            if (!obj || !fn || !sp || structSize <= 0) lua.throw_error("CallWithStruct: bad arg");
+            std::string s(fn); std::wstring wname(s.begin(), s.end());
+            Unreal::UFunction* func = nullptr;
+            for (Unreal::UClass* cur = obj->GetClassPrivate(); cur; ) {
+                for (auto* f : cur->ForEachFunction()) if (f && f->GetFName().ToString() == wname) { func = f; break; }
+                if (func) break;
+                auto* sup = cur->GetSuperClass(); if (!sup || sup->GetFName().ToString() == STR("Object")) break; cur = sup;
+            }
+            if (!func) lua.throw_error("CallWithStruct: function not found");
+            uint16_t parmsSize = func->GetParmsSize();
+            std::vector<uint8_t> buffer(parmsSize > 0 ? parmsSize : 1, 0);
+            int structWrote = 0, nameWrote = 0; int32_t structPropSize = -1;
+            for (auto* prop : func->ForEachProperty()) {
+                if (!prop) continue;
+                if (!prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm)) continue;
+                if (prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_ReturnParm)) continue;
+                int32_t off = prop->GetOffset_Internal();
+                if (off < 0 || static_cast<size_t>(off) >= buffer.size()) continue;
+                auto ptype = prop->GetClass().GetFName().ToString();
+                void* dst = buffer.data() + off;
+                if (ptype == STR("StructProperty") && structWrote == 0) {
+                    structPropSize = prop->GetSize();
+                    if (structPropSize == structSize && static_cast<size_t>(off + structPropSize) <= buffer.size()) {
+                        memcpy(dst, reinterpret_cast<void*>(sp), static_cast<size_t>(structPropSize));
+                        structWrote++;
+                    }
+                } else if (ptype == STR("NameProperty") && nameStr) {
+                    *reinterpret_cast<Unreal::FName*>(dst) = Unreal::FName(ensure_str(nameStr).c_str(), Unreal::FNAME_Add);
+                    nameWrote++;
+                }
+                // other params: leave zeroed default
+            }
+            if (structWrote == 0)
+                Output::send(STR("[VeinCF] CallWithStruct: WARN no struct written (handleSize={} structPropSize={}) — size mismatch?\n"), structSize, structPropSize);
+            obj->ProcessEvent(func, buffer.data());
+            Output::send(STR("[VeinCF] CallWithStruct: {} (parms={} structWrote={} nameWrote={})\n"), wname, parmsSize, structWrote, nameWrote);
+            lua_newtable(L);
+            lua_pushboolean(L, 1); lua_setfield(L, -2, "ok");
+            lua_pushinteger(L, structWrote); lua_setfield(L, -2, "structWrote");
+            lua_pushinteger(L, nameWrote); lua_setfield(L, -2, "nameWrote");
+            return 1;
+        });
+
+        // VeinCF: call a UFunction whose params are (object, class, object...) in order and RETURN its
+        // Object return value as a usable Lua object. Built for UMG WidgetBlueprintLibrary:Create (UE4SS's
+        // reflected call drops the UserWidget return — same marshalling gap as the inventory struct). The
+        // first ObjectProperty param gets arg2, the ClassProperty gets arg3, the next ObjectProperty gets
+        // arg4; the ObjectProperty ReturnValue comes back to Lua. SEH-free (same as CallFunctionWithClass).
+        // Usage: CallReturningObject(targetObj, "FnName", objArg1, classArg, objArg2OrNil) -> UObject | nil
+        lua.register_function("CallReturningObject", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (lua.get_stack_size() < 2 || !lua.is_userdata(1)) lua.throw_error("CallReturningObject(obj, fn, [objA], [class], [objB])");
+            lua_State* L = lua.get_lua_state();
+            Unreal::UObject* obj = lua.get_userdata<LuaType::UObject>(1, true).get_remote_cpp_object();
+            const char* fn = lua_tostring(L, 2);
+            if (!obj || !fn) lua.throw_error("CallReturningObject: null arg");
+            auto arg_obj = [&](int idx) -> Unreal::UObject* {
+                if (lua.get_stack_size() >= idx && lua.is_userdata(idx)) return lua.get_userdata<LuaType::UObject>(idx, true).get_remote_cpp_object();
+                return nullptr;
+            };
+            Unreal::UObject* objA  = arg_obj(3);   // first ObjectProperty param (e.g. WorldContext)
+            Unreal::UObject* clsA  = arg_obj(4);   // ClassProperty param (e.g. WidgetType)
+            Unreal::UObject* objB  = arg_obj(5);   // second ObjectProperty param (e.g. OwningPlayer)
+            std::string s(fn); std::wstring wname(s.begin(), s.end());
+            Unreal::UFunction* func = nullptr;
+            for (Unreal::UClass* cur = obj->GetClassPrivate(); cur; ) {
+                for (auto* f : cur->ForEachFunction()) if (f && f->GetFName().ToString() == wname) { func = f; break; }
+                if (func) break;
+                auto* sup = cur->GetSuperClass(); if (!sup || sup->GetFName().ToString() == STR("Object")) break; cur = sup;
+            }
+            if (!func) lua.throw_error("CallReturningObject: function not found");
+            uint16_t parmsSize = func->GetParmsSize();
+            std::vector<uint8_t> buffer(parmsSize > 0 ? parmsSize : 1, 0);
+            Unreal::FProperty* retProp = nullptr; int objSeen = 0;
+            for (auto* prop : func->ForEachProperty()) {
+                if (!prop || !prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm)) continue;
+                if (prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_ReturnParm)) { retProp = prop; continue; }
+                int32_t off = prop->GetOffset_Internal();
+                if (off < 0 || static_cast<size_t>(off) >= buffer.size()) continue;
+                auto ptype = prop->GetClass().GetFName().ToString();
+                void* dst = buffer.data() + off;
+                if (ptype == STR("ClassProperty")) { *reinterpret_cast<Unreal::UObject**>(dst) = clsA; }
+                else if (ptype == STR("ObjectProperty")) { *reinterpret_cast<Unreal::UObject**>(dst) = (objSeen++ == 0) ? objA : objB; }
+            }
+            obj->ProcessEvent(func, buffer.data());
+            Unreal::UObject* ret = nullptr;
+            if (retProp) { int32_t ro = retProp->GetOffset_Internal(); if (ro >= 0 && static_cast<size_t>(ro) < buffer.size()) ret = *reinterpret_cast<Unreal::UObject**>(buffer.data() + ro); }
+            Output::send(STR("[VeinCF] CallReturningObject: {} -> {}\n"), wname, (uint64_t)(uintptr_t)ret);
+            if (ret) LuaType::auto_construct_object(lua, ret); else lua_pushnil(L);
+            return 1;
+        });
+
         // VeinCF: Spawn an actor of a class at a world location — the menu-free spawn MECHANISM
         // (what the admin SpawnAI calls down into), with NO widget/UI in the loop. worldContext =
         // any live UObject in the world (e.g. an existing zombie, or the player); we pull its UWorld
@@ -4317,12 +4514,22 @@ Overloads:
                 lua_pushboolean(L, validated?1:0);     lua_setfield(L,-2,"validated");
             };
 
-            if (!dataPtr || !allocFlags || !hashTable || hashSize <= 0 || (hashSize & (hashSize-1)) != 0)
+            // NOTE: allocFlags (TBitArray SecondaryData) is legitimately NULL for a small INLINE bitarray
+            // (e.g. Illness, 5 entries — bits live inline) so do NOT treat it as fatal here; prepare() below
+            // migrates it to heap. Only dataPtr/hashTable/hashSize must be valid up front.
+            if (!dataPtr || !hashTable || hashSize <= 0 || (hashSize & (hashSize-1)) != 0)
             { Output::send(STR("[VeinCF] RegisterRecipeDirect: header read bad\n")); pushres(false, arrayNum, arrayNum); return 1; }
             if (!validated)
             { Output::send(STR("[VeinCF] RegisterRecipeDirect: HASH MISMATCH tmplBucket={} tmplHashIdx={} -> refusing\n"), tmplBucket, tmplHashIdx); pushres(false, arrayNum, arrayNum); return 1; }
-            if (arrayNum >= arrayMax)
-            { Output::send(STR("[VeinCF] RegisterRecipeDirect: no free slot (num={} max={}) -> realloc needed, refusing\n"), arrayNum, arrayMax); pushres(false, arrayNum, arrayNum); return 1; }
+            // ensure heap-backed alloc flags + a free slot (migrates inline bitarray -> heap; grows Data if full)
+            if (!veincf_sparseset_prepare(td + 0x178, 0x98, arrayNum, arrayMax))
+            { Output::send(STR("[VeinCF] RegisterRecipeDirect: prepare/grow failed (num={} max={}) -> refusing\n"), arrayNum, arrayMax); pushres(false, arrayNum, arrayNum); return 1; }
+            dataPtr    = reinterpret_cast<uint8_t*>(r64(td + 0x178));   // Data may have moved
+            arrayMax   = (int32_t)r32(td + 0x184);
+            allocFlags = reinterpret_cast<uint8_t*>(r64(td + 0x198));   // bitarray now heap-backed (non-null)
+            if (!allocFlags)
+            { Output::send(STR("[VeinCF] RegisterRecipeDirect: allocFlags still null after prepare -> refusing\n")); pushres(false, arrayNum, arrayNum); return 1; }
+            Output::send(STR("[VeinCF] RegisterRecipeDirect: prepared num={} max={} data={} flags={}\n"), arrayNum, arrayMax, (uint64_t)(uintptr_t)dataPtr, (uint64_t)(uintptr_t)allocFlags);
 
             bool ok = veincf_tset_insert(
                 dataPtr, arrayNum, reinterpret_cast<uint8_t*>(srcElem),
@@ -4416,7 +4623,14 @@ Overloads:
                 arrayNum, arrayMax, hashSize, (int)validated, vSlot, vComputed, vStored, bucket, (int)dryRun);
             if (dryRun)     { pushres(true,  false, arrayNum); return 1; }
             if (!validated) { Output::send(STR("[VeinCF] RegInAR: NOT validated -> refusing write\n")); pushres(false, false, arrayNum); return 1; }
-            if (arrayNum >= arrayMax) { Output::send(STR("[VeinCF] RegInAR: no spare (num>=max) -> refusing\n")); pushres(false, false, arrayNum); return 1; }
+            if (arrayNum >= arrayMax) {
+                if (!veincf_sparseset_prepare(cset + 0x00, 0x10, arrayNum, arrayMax))
+                { Output::send(STR("[VeinCF] RegInAR: prepare/grow failed (num={} max={}) -> refusing\n"), arrayNum, arrayMax); pushres(false, false, arrayNum); return 1; }
+                dataPtr    = reinterpret_cast<uint8_t*>(r64(cset + 0x00));
+                arrayMax   = (int32_t)r32(cset + 0x0C);
+                allocFlags = reinterpret_cast<uint8_t*>(r64(cset + 0x20));
+                Output::send(STR("[VeinCF] RegInAR: GREW CachedAssets -> max={}\n"), arrayMax);
+            }
 
             if (!srcFA) { Output::send(STR("[VeinCF] RegInAR: no validated src to clone -> refusing\n")); pushres(false, false, arrayNum); return 1; }
             uint64_t newPkg = 0, newNm = 0;
