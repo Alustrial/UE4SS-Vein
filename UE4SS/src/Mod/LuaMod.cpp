@@ -63,6 +63,8 @@
 #include <LuaType/LuaOverlay.hpp>
 #include <Unreal/UAssetRegistryHelpers.hpp>
 #include <Unreal/CoreUObject/UObject/Class.hpp>
+#include <Unreal/SoftObjectPtr.hpp>  // VeinCF: build soft-class params in C++ for CallFunctionWithClass
+#include <Unreal/World.hpp>          // VeinCF: UWorld::SpawnActor + FVector for SpawnActorAtLocation
 #include <Unreal/UGameViewportClient.hpp>
 #include <Unreal/UKismetSystemLibrary.hpp>
 #include <Unreal/UObjectGlobals.hpp>
@@ -305,6 +307,138 @@ static bool veincf_call_inserter(uintptr_t fn, void* am, void* id, void* assetDa
     }
 }
 
+// VeinCF: 0.024-hotfix path. The am-level TryUpdateCachedAssetData is unfindable on the Test build
+// (log strings stripped). The PER-TYPE inner inserter (FPrimaryAssetTypeData::*, found via the
+// 0x178 disp-scan) inserts an FAssetData straight into a type's AssetMap: fn(typeData, assetData).
+// We resolve the Recipe FPrimaryAssetTypeData ourselves (am+0x470 walk) and call it directly.
+static bool veincf_call_inner_inserter(uintptr_t fn, void* typeData, void* assetData, uintptr_t* out)
+{
+    __try
+    {
+        typedef void* (*Fn)(void*, void*);
+        *out = reinterpret_cast<uintptr_t>(reinterpret_cast<Fn>(fn)(typeData, assetData));
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: SEH-safe memcpy (POD frame) — copy from a possibly-bad source address without faulting.
+static bool veincf_safe_memcpy(void* dst, const void* src, size_t n)
+{
+    __try { memcpy(dst, src, n); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: DIY TMap insert (POD frame). Writes a cloned+identity-swapped element into the per-type
+// AssetMap's TSet at index `num`, links it into hash `bucket`, sets the allocation bit, bumps the
+// counts. All targets are validated/mapped game memory. No function calls into the game -> no
+// wrong-function crashes. Element stride 0x98: key@+0x00, value[0x08,0x90), HashNextId@+0x90,
+// HashIndex@+0x94. allocFlags = uint32 words. Returns false only on a fault.
+static bool veincf_tset_insert(
+    uint8_t* dataPtr, int32_t num, uint8_t* srcElem,
+    uint64_t newKey, uint64_t oldNm, uint64_t oldPath, uint64_t newNm, uint64_t newPath,
+    uint32_t* hashTable, int32_t bucket,
+    uint8_t* allocFlags, int32_t* arrayNumAddr, int32_t* allocNumBitsAddr)
+{
+    const int STRIDE = 0x98;
+    __try
+    {
+        uint8_t* dst = dataPtr + (size_t)num * STRIDE;
+        memcpy(dst, srcElem, STRIDE);                                   // clone the whole element
+        *reinterpret_cast<uint64_t*>(dst + 0x00) = newKey;              // key = new PrimaryAssetName
+        for (int i = 0x08; i + 8 <= 0x90; i += 8)                       // swap identity FNames in value
+        {
+            uint64_t* q = reinterpret_cast<uint64_t*>(dst + i);
+            if (*q == oldNm)        *q = newNm;
+            else if (*q == oldPath) *q = newPath;
+        }
+        *reinterpret_cast<int32_t*>(dst + 0x90) = static_cast<int32_t>(hashTable[bucket]); // HashNextId = old head
+        *reinterpret_cast<int32_t*>(dst + 0x94) = bucket;               // HashIndex
+        hashTable[bucket] = static_cast<uint32_t>(num);                 // bucket head = our index
+        reinterpret_cast<uint32_t*>(allocFlags)[num >> 5] |= (1u << (num & 31)); // allocation bit
+        *arrayNumAddr     = num + 1;                                    // SparseArray.ArrayNum
+        *allocNumBitsAddr = *allocNumBitsAddr + 1;                      // AllocFlags.NumBits
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: SEH-safe insert of an FAssetData* into the AssetRegistry CachedAssets TSet<FAssetData*>
+// (FAssetRegistryState::CachedAssets — what GetAssetByObjectPath/the surfacing filter reads). Element
+// stride 0x10: value(FAssetData*)@+0x00, HashNextId(int32)@+0x08, HashIndex(int32)@+0x0C. Appends at
+// the high-water index `num`; caller guarantees num<max + a validated hash. POD frame for SEH.
+static bool veincf_cset_insert_ptr(
+    uint8_t* dataPtr, int32_t num, uintptr_t fadPtr,
+    uint32_t* hashTable, int32_t bucket,
+    uint8_t* allocFlags, int32_t* arrayNumAddr, int32_t* allocNumBitsAddr)
+{
+    const int STRIDE = 0x10;
+    __try
+    {
+        uint8_t* dst = dataPtr + (size_t)num * STRIDE;
+        *reinterpret_cast<uintptr_t*>(dst + 0x00) = fadPtr;                                 // FAssetData* value
+        *reinterpret_cast<int32_t*>(dst + 0x08) = static_cast<int32_t>(hashTable[bucket]);  // HashNextId = old head
+        *reinterpret_cast<int32_t*>(dst + 0x0C) = bucket;                                   // HashIndex
+        hashTable[bucket] = static_cast<uint32_t>(num);                                     // bucket head = our index
+        reinterpret_cast<uint32_t*>(allocFlags)[num >> 5] |= (1u << (num & 31));            // allocation bit
+        *arrayNumAddr     = num + 1;                                                        // SparseArray.ArrayNum
+        *allocNumBitsAddr = *allocNumBitsAddr + 1;                                          // AllocFlags.NumBits
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: SEH-safe CLONE+SWAP+INSERT into the AssetRegistry CachedAssets TSet<FAssetData*>. The AR
+// FAssetData layout (PackageName@+0x00, AssetName@+0x10) differs from the AssetManager's, so we cannot
+// point the AR at an AM FAssetData. Instead: malloc a 0x68 FAssetData, memcpy a REAL CachedAssets
+// element's FAssetData (correct AR layout + valid tags), swap its identity FNames (oldPkg->newPkg,
+// oldName->newName), and insert a CachedAssets element pointing at the clone. POD frame for SEH.
+static bool veincf_cset_clone_swap_insert(
+    uint8_t* dataPtr, int32_t num, uint8_t* srcFA,
+    uint64_t oldPkg, uint64_t newPkg, uint64_t oldName, uint64_t newName,
+    uint32_t* hashTable, int32_t bucket,
+    uint8_t* allocFlags, int32_t* arrayNumAddr, int32_t* allocNumBitsAddr,
+    void** outClone)
+{
+    const int STRIDE = 0x10;
+    const int FADSZ  = 0x68;
+    __try
+    {
+        uint8_t* clone = reinterpret_cast<uint8_t*>(malloc(FADSZ));
+        if (!clone) return false;
+        memcpy(clone, srcFA, FADSZ);
+        for (int i = 0; i + 8 <= FADSZ; i += 8)                          // swap identity FNames -> ours
+        {
+            uint64_t* q = reinterpret_cast<uint64_t*>(clone + i);
+            if (*q == oldPkg)       *q = newPkg;
+            else if (*q == oldName) *q = newName;
+        }
+        uint8_t* dst = dataPtr + (size_t)num * STRIDE;
+        *reinterpret_cast<uintptr_t*>(dst + 0x00) = reinterpret_cast<uintptr_t>(clone); // FAssetData* = our clone
+        *reinterpret_cast<int32_t*>(dst + 0x08) = static_cast<int32_t>(hashTable[bucket]);
+        *reinterpret_cast<int32_t*>(dst + 0x0C) = bucket;
+        hashTable[bucket] = static_cast<uint32_t>(num);
+        reinterpret_cast<uint32_t*>(allocFlags)[num >> 5] |= (1u << (num & 31));
+        *arrayNumAddr     = num + 1;
+        *allocNumBitsAddr = *allocNumBitsAddr + 1;
+        if (outClone) *outClone = clone;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: SEH-safe call of the engine CreatePackage(const TCHAR* PackageName) -> UPackage*. Makes a
+// real runtime UPackage (UE4SS's StaticConstructObject wrapper can't — it rejects a nil outer).
+static void* veincf_call_createpackage(uintptr_t fn, const wchar_t* name)
+{
+    __try
+    {
+        typedef void* (*Fn)(const wchar_t*);
+        return reinterpret_cast<Fn>(fn)(name);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
 // VeinCF: SEH-safe call of an IAssetRegistry scan virtual (resolved via vtable):
 //   void (this, const TArray<FString>& InPaths, bool bForceRescan, bool bIgnoreDenyList)
 // The FRONT-DOOR loader verb: force-rescan + index a content path (e.g. a mounted mod
@@ -406,6 +540,111 @@ static bool veincf_get_main_module(uint8_t** outBase, size_t* outSize,
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: locate the PE exception directory (.pdata) = the COMPLETE table of every
+// function's {BeginAddress, EndAddress, UnwindData} (RVAs, 12 bytes each). x64 PE
+// REQUIRES .pdata for stack unwinding so it CANNOT be stripped -> a full, symbol-free
+// function inventory on ANY shipping Windows UE binary. The foundation of structural
+// resolution (find a fn by fingerprint, no strings). Returns the array ptr + entry count.
+static bool veincf_get_pdata(uint8_t* base, uint8_t** outPdata, uint32_t* outCount)
+{
+    if (!base) return false;
+    __try
+    {
+        if (*reinterpret_cast<uint16_t*>(base) != 0x5A4D) return false;          // 'MZ'
+        int32_t e_lfanew = *reinterpret_cast<int32_t*>(base + 0x3C);
+        uint8_t* nt = base + e_lfanew;
+        if (*reinterpret_cast<uint32_t*>(nt) != 0x00004550) return false;         // 'PE\0\0'
+        uint8_t* opt = nt + 0x18;                                                 // OptionalHeader (PE32+)
+        // DataDirectory starts at opt+0x70; entry [3] = IMAGE_DIRECTORY_ENTRY_EXCEPTION
+        uint32_t rva  = *reinterpret_cast<uint32_t*>(opt + 0x70 + 3 * 8 + 0);
+        uint32_t size = *reinterpret_cast<uint32_t*>(opt + 0x70 + 3 * 8 + 4);
+        if (!rva || !size) return false;
+        *outPdata = base + rva;
+        *outCount = size / 12;                                                    // sizeof(RUNTIME_FUNCTION)
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: one .pdata entry = {BeginAddress, EndAddress, UnwindData} (all RVAs).
+struct VeincfFuncEntry { uint32_t begin; uint32_t end; uint32_t unwind; };
+
+// VeinCF: SEH-safe read of the i-th function's bounds (RVAs).
+static bool veincf_pdata_sample(uint8_t* pdata, uint32_t i, uint32_t* outBegin, uint32_t* outEnd)
+{
+    __try
+    {
+        const VeincfFuncEntry* arr = reinterpret_cast<const VeincfFuncEntry*>(pdata);
+        *outBegin = arr[i].begin; *outEnd = arr[i].end;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: SEH-safe linear find of the function whose [begin,end) brackets probeRva.
+// The verify-live check: feed a KNOWN function address, confirm .pdata correctly
+// brackets it -> the enumeration is real.
+static bool veincf_pdata_find(uint8_t* pdata, uint32_t count, uint32_t probeRva,
+                              uint32_t* outBegin, uint32_t* outEnd, int* outIndex)
+{
+    __try
+    {
+        const VeincfFuncEntry* arr = reinterpret_cast<const VeincfFuncEntry*>(pdata);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            if (probeRva >= arr[i].begin && probeRva < arr[i].end)
+            {
+                *outBegin = arr[i].begin; *outEnd = arr[i].end; *outIndex = (int)i;
+                return true;
+            }
+        }
+        return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// VeinCF: one structural match = a function + its size + per-displacement hit counts.
+struct VeincfDispMatch { uintptr_t addr; uint32_t size; int hits[8]; };
+
+// VeinCF: the structural matcher core. Iterate EVERY .pdata function; for each, byte-scan
+// its body for the requested displacement constants (a `[reg+0xNNN]` disp32 encodes as the
+// 4 LE bytes == the value). A function MATCHES if it contains ALL requested displacements.
+// This is the symbol-free "find functions that touch offsets X,Y,Z" verb — the prefilter
+// that turns 571k functions into a handful to disasm-inspect. SEH-wrapped, POD-only.
+static int veincf_find_disp(uint8_t* base, uint8_t* pdata, uint32_t count,
+                            const uint32_t* pats, int nPat, int maxResults,
+                            VeincfDispMatch* out)
+{
+    int found = 0;
+    __try
+    {
+        const VeincfFuncEntry* arr = reinterpret_cast<const VeincfFuncEntry*>(pdata);
+        for (uint32_t i = 0; i < count && found < maxResults; ++i)
+        {
+            uint8_t* b = base + arr[i].begin;
+            uint8_t* e = base + arr[i].end;
+            if (e <= b || (size_t)(e - b) < 4) continue;
+            int hits[8] = { 0 };
+            for (uint8_t* q = b; q + 4 <= e; ++q)
+            {
+                uint32_t v = *reinterpret_cast<uint32_t*>(q);
+                for (int p = 0; p < nPat; ++p) if (v == pats[p]) hits[p]++;
+            }
+            bool all = true;
+            for (int p = 0; p < nPat; ++p) if (hits[p] == 0) { all = false; break; }
+            if (all)
+            {
+                out[found].addr = reinterpret_cast<uintptr_t>(b);
+                out[found].size = arr[i].end - arr[i].begin;
+                for (int p = 0; p < nPat; ++p) out[found].hits[p] = hits[p];
+                found++;
+            }
+        }
+        return found;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return found; }
 }
 
 // VeinCF: nearest preceding MSVC int3-padding (0xCC) before a code address ->
@@ -3419,10 +3658,20 @@ Overloads:
             if (!obj || !fn) lua.throw_error("DumpFunctionParams: null arg");
             std::string s(fn); std::wstring wname(s.begin(), s.end());
 
+            // Walk the FULL class hierarchy (like DumpClassProperties) — Blueprint/admin verbs
+            // live on the immediate BP class while inherited ones live up the chain; a single-
+            // level ForEachFunction misses them.
             Unreal::UFunction* func = nullptr;
-            for (auto* f : obj->GetClassPrivate()->ForEachFunction())
+            for (Unreal::UClass* current = obj->GetClassPrivate(); current; )
             {
-                if (f && f->GetFName().ToString() == wname) { func = f; break; }
+                for (auto* f : current->ForEachFunction())
+                {
+                    if (f && f->GetFName().ToString() == wname) { func = f; break; }
+                }
+                if (func) break;
+                auto* super = current->GetSuperClass();
+                if (!super || super->GetFName().ToString() == STR("Object")) break;
+                current = super;
             }
             if (!func) lua.throw_error("DumpFunctionParams: function not found");
 
@@ -3450,6 +3699,124 @@ Overloads:
             lua_pushinteger(L, func->GetReturnValueOffset());
             Output::send(STR("[VeinCF] DumpFunctionParams: {} params for {}\n"), entry - 1, wname);
             return 3; // table, numParms, returnValueOffset
+        });
+
+        // VeinCF: Call a UFunction passing a CLASS as its argument(s), with any soft-class /
+        // soft-object PARAM constructed in C++ (FSoftObjectPtr from the hard class). This avoids
+        // UE4SS's Lua soft-object marshaller (push_softobjectproperty), which blindly reinterprets
+        // a hard UClass userdata as a TSoftObjectPtr and AVs on the path FString. Every class /
+        // object / soft-class param is filled with the given class; all other params are left
+        // zero (default). Built for single-class-arg verbs like SpawnAI(AIClass:SoftClass).
+        // Runs on the calling thread -> invoke from inside ExecuteInGameThread (game thread).
+        // Usage: CallFunctionWithClass(obj, "FuncName", classObj) -> {ok, parms, wrote, softWrote}
+        lua.register_function("CallFunctionWithClass", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (lua.get_stack_size() < 3 || !lua.is_userdata(1) || !lua.is_userdata(3))
+                lua.throw_error("CallFunctionWithClass requires (obj, funcName, classObj)");
+            lua_State* L = lua.get_lua_state();
+            Unreal::UObject* obj = lua.get_userdata<LuaType::UObject>(1, true).get_remote_cpp_object();
+            const char* fn = lua_tostring(L, 2);
+            Unreal::UObject* classObj = lua.get_userdata<LuaType::UObject>(3, true).get_remote_cpp_object();
+            if (!obj || !fn || !classObj) lua.throw_error("CallFunctionWithClass: null arg");
+            std::string s(fn); std::wstring wname(s.begin(), s.end());
+
+            // find UFunction via FULL hierarchy walk (like DumpClassProperties/DumpFunctionParams)
+            Unreal::UFunction* func = nullptr;
+            for (Unreal::UClass* current = obj->GetClassPrivate(); current; )
+            {
+                for (auto* f : current->ForEachFunction())
+                {
+                    if (f && f->GetFName().ToString() == wname) { func = f; break; }
+                }
+                if (func) break;
+                auto* super = current->GetSuperClass();
+                if (!super || super->GetFName().ToString() == STR("Object")) break;
+                current = super;
+            }
+            if (!func) lua.throw_error("CallFunctionWithClass: function not found");
+
+            uint16_t parmsSize = func->GetParmsSize();
+            std::vector<uint8_t> buffer(parmsSize > 0 ? parmsSize : 1, 0);
+
+            int wrote = 0, softWrote = 0;
+            std::vector<Unreal::FProperty*> toDestroy;
+            for (auto* prop : func->ForEachProperty())
+            {
+                if (!prop) continue;
+                if (!prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_Parm)) continue;
+                if (prop->HasAnyPropertyFlags(Unreal::EPropertyFlags::CPF_ReturnParm)) continue;
+                int32_t off = prop->GetOffset_Internal();
+                if (off < 0 || static_cast<size_t>(off) >= buffer.size()) continue;
+                auto ptype = prop->GetClass().GetFName().ToString();
+                void* dst = buffer.data() + off;
+                if (ptype.find(STR("Soft")) != std::wstring::npos)
+                {
+                    // soft-class / soft-object: assign from the hard class (builds the soft path)
+                    *reinterpret_cast<Unreal::FSoftObjectPtr*>(dst) = Unreal::FSoftObjectPtr(classObj);
+                    toDestroy.push_back(prop);
+                    softWrote++;
+                }
+                else if (ptype == STR("ClassProperty") || ptype == STR("ObjectProperty"))
+                {
+                    *reinterpret_cast<Unreal::UObject**>(dst) = classObj;
+                    wrote++;
+                }
+                // else: leave zeroed default
+            }
+
+            obj->ProcessEvent(func, buffer.data());
+
+            // free non-trivial param allocations (the soft-path FString etc.)
+            for (auto* prop : toDestroy)
+            {
+                int32_t off = prop->GetOffset_Internal();
+                if (off >= 0 && static_cast<size_t>(off) < buffer.size())
+                    prop->DestroyValue(buffer.data() + off);
+            }
+
+            Output::send(STR("[VeinCF] CallFunctionWithClass: {} (parms={} wrote={} soft={})\n"), wname, parmsSize, wrote, softWrote);
+            lua_newtable(L);
+            lua_pushboolean(L, 1); lua_setfield(L, -2, "ok");
+            lua_pushinteger(L, parmsSize); lua_setfield(L, -2, "parms");
+            lua_pushinteger(L, wrote); lua_setfield(L, -2, "wrote");
+            lua_pushinteger(L, softWrote); lua_setfield(L, -2, "softWrote");
+            return 1;
+        });
+
+        // VeinCF: Spawn an actor of a class at a world location — the menu-free spawn MECHANISM
+        // (what the admin SpawnAI calls down into), with NO widget/UI in the loop. worldContext =
+        // any live UObject in the world (e.g. an existing zombie, or the player); we pull its UWorld
+        // and SpawnActor the class there. This is the framework's generic "spawn anything anywhere"
+        // verb — tie it to any event (e.g. a zombie's tick) to compose mechanics like the breeder.
+        // Run on the game thread (inside ExecuteInGameThread).
+        // Usage: SpawnActorAtLocation(worldContextObj, classObj, x, y, z) -> {ok, actor=fullname}
+        lua.register_function("SpawnActorAtLocation", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (lua.get_stack_size() < 5 || !lua.is_userdata(1) || !lua.is_userdata(2))
+                lua.throw_error("SpawnActorAtLocation requires (worldContextObj, classObj, x, y, z)");
+            lua_State* L = lua.get_lua_state();
+            Unreal::UObject* ctx = lua.get_userdata<LuaType::UObject>(1, true).get_remote_cpp_object();
+            Unreal::UObject* classObj = lua.get_userdata<LuaType::UObject>(2, true).get_remote_cpp_object();
+            double x = lua_tonumber(L, 3), y = lua_tonumber(L, 4), z = lua_tonumber(L, 5);
+            if (!ctx || !classObj) lua.throw_error("SpawnActorAtLocation: null arg");
+            Unreal::UClass* cls = static_cast<Unreal::UClass*>(classObj);
+            Unreal::UWorld* world = ctx->GetWorld();
+            if (!world) lua.throw_error("SpawnActorAtLocation: no world from context");
+
+            Unreal::FVector loc(x, y, z);
+            Unreal::AActor* actor = world->SpawnActor(cls, &loc, nullptr);
+
+            lua_newtable(L);
+            lua_pushboolean(L, actor != nullptr ? 1 : 0); lua_setfield(L, -2, "ok");
+            if (actor)
+            {
+                auto fn = to_string(reinterpret_cast<Unreal::UObject*>(actor)->GetFullName());
+                lua_pushstring(L, fn.c_str()); lua_setfield(L, -2, "actor");
+                Output::send(STR("[VeinCF] SpawnActorAtLocation: {}\n"), reinterpret_cast<Unreal::UObject*>(actor)->GetFullName());
+            }
+            else
+            {
+                Output::send(STR("[VeinCF] SpawnActorAtLocation: spawn returned null\n"));
+            }
+            return 1;
         });
 
         // VeinCF: Find the real native method that a UFunction's exec-thunk calls.
@@ -3811,6 +4178,279 @@ Overloads:
             return 1;
         });
 
+        // VeinCF: 0.024-hotfix registration. Build the same minimal FAssetData, but call the
+        // PER-TYPE inner inserter directly: fn(typeDataPtr, &assetData). typeDataPtr = the Recipe
+        // FPrimaryAssetTypeData* (resolved Lua-side via the am+0x470 AssetTypeMap walk). Sidesteps
+        // the unfindable am-level funnel (Test build strips its log strings). Returns call_ok(bool).
+        // Usage: InsertAssetIntoType(innerFnHex, typeDataPtrHex, name, pkgName, pkgPath, classPkg, className, classPathOff) -> bool
+        lua.register_function("InsertAssetIntoType", [](const LuaMadeSimple::Lua& lua) -> int {
+            lua_State* L = lua.get_lua_state();
+            if (lua.get_stack_size() < 8)
+                lua.throw_error("InsertAssetIntoType(innerFnHex, typeDataPtrHex, name, pkgName, pkgPath, classPkg, className, classPathOff)");
+            uintptr_t fn       = (uintptr_t)strtoull(lua_tostring(L, 1), nullptr, 16);
+            uintptr_t typeData = (uintptr_t)strtoull(lua_tostring(L, 2), nullptr, 16);
+            const char* assetName = lua_tostring(L, 3);
+            const char* pkgName   = lua_tostring(L, 4);
+            const char* pkgPath   = lua_tostring(L, 5);
+            const char* classPkg  = lua_tostring(L, 6);
+            const char* className = lua_tostring(L, 7);
+            int classPathOff = (int)lua_tointeger(L, 8);
+            if (!fn || !typeData || !assetName || !pkgName) lua.throw_error("InsertAssetIntoType: bad arg");
+
+            alignas(8) uint8_t assetData[0xA0] = {0};
+            uint8_t* p = assetData;
+            *reinterpret_cast<Unreal::FName*>(p + 0x00) = Unreal::FName(ensure_str(pkgName).c_str(),   Unreal::FNAME_Add); // PackageName
+            *reinterpret_cast<Unreal::FName*>(p + 0x08) = Unreal::FName(ensure_str(pkgPath).c_str(),   Unreal::FNAME_Add); // PackagePath
+            *reinterpret_cast<Unreal::FName*>(p + 0x10) = Unreal::FName(ensure_str(assetName).c_str(), Unreal::FNAME_Add); // AssetName
+            if (classPathOff > 0 && classPathOff + 16 <= (int)sizeof(assetData) && classPkg && className)
+            {
+                *reinterpret_cast<Unreal::FName*>(p + classPathOff + 0) = Unreal::FName(ensure_str(classPkg).c_str(),  Unreal::FNAME_Add);
+                *reinterpret_cast<Unreal::FName*>(p + classPathOff + 8) = Unreal::FName(ensure_str(className).c_str(), Unreal::FNAME_Add);
+            }
+
+            uintptr_t ret = 0;
+            bool ok = veincf_call_inner_inserter(fn, reinterpret_cast<void*>(typeData), assetData, &ret);
+            Output::send(STR("[VeinCF] InsertAssetIntoType {} -> call_ok={} ret={:#x}\n"),
+                ensure_str(assetName), (int)ok, (unsigned long long)ret);
+            lua.set_bool(ok);
+            return 1;
+        });
+
+        // VeinCF: PERMANENT registration — clone a REAL catalog entry, swap only its identity FNames,
+        // let the game's own per-type inner inserter do the hash-correct insert. No hand-built struct
+        // (that crashed: wrong layout), no DIY TMap hashing. Copies the real FAssetData value (POD-ish,
+        // mostly FNames) from srcValue, find/replaces every 8-byte FName slot == oldName/oldPath with
+        // newName/newPath, then fn(typeData, &clone). Depends only on stable struct offsets + the live
+        // template — nothing that moves on a recompile.
+        // Usage: CloneAssetEntry(innerFnHex, typeDataHex, srcValueHex, valueSize, oldName, oldPath, newName, newPath) -> {ok, repl}
+        lua.register_function("CloneAssetEntry", [](const LuaMadeSimple::Lua& lua) -> int {
+            lua_State* L = lua.get_lua_state();
+            if (lua.get_stack_size() < 8)
+                lua.throw_error("CloneAssetEntry(innerFn, typeData, srcValue, valueSize, oldName, oldPath, newName, newPath)");
+            uintptr_t fn       = (uintptr_t)strtoull(lua_tostring(L, 1), nullptr, 16);
+            uintptr_t typeData = (uintptr_t)strtoull(lua_tostring(L, 2), nullptr, 16);
+            uintptr_t src      = (uintptr_t)strtoull(lua_tostring(L, 3), nullptr, 16);
+            int vsize = (int)lua_tointeger(L, 4);
+            auto fnbits = [](const char* s) -> uint64_t {
+                Unreal::FName n(ensure_str(s).c_str(), Unreal::FNAME_Add);
+                return *reinterpret_cast<uint64_t*>(&n);
+            };
+            uint64_t oldNm   = fnbits(lua_tostring(L, 5));
+            uint64_t oldPath = fnbits(lua_tostring(L, 6));
+            uint64_t newNm   = fnbits(lua_tostring(L, 7));
+            uint64_t newPath = fnbits(lua_tostring(L, 8));
+            if (!fn || !typeData || !src || vsize <= 0 || vsize > 0x200) lua.throw_error("CloneAssetEntry: bad arg");
+
+            alignas(8) uint8_t buf[0x200] = {0};
+            if (!veincf_safe_memcpy(buf, reinterpret_cast<void*>(src), (size_t)vsize))
+            {
+                lua.set_bool(false); Output::send(STR("[VeinCF] CloneAssetEntry: src read faulted\n")); return 1;
+            }
+
+            int nrepl = 0;
+            for (int i = 0; i + 8 <= vsize; i += 8)
+            {
+                uint64_t* q = reinterpret_cast<uint64_t*>(buf + i);
+                if (*q == oldNm)        { *q = newNm;   nrepl++; }
+                else if (*q == oldPath) { *q = newPath; nrepl++; }
+            }
+            uintptr_t ret = 0;
+            bool ok = veincf_call_inner_inserter(fn, reinterpret_cast<void*>(typeData), buf, &ret);
+            Output::send(STR("[VeinCF] CloneAssetEntry repl={} call_ok={} ret={:#x}\n"), nrepl, (int)ok, (unsigned long long)ret);
+            lua_newtable(L);
+            lua_pushboolean(L, ok ? 1 : 0); lua_setfield(L, -2, "ok");
+            lua_pushinteger(L, nrepl); lua_setfield(L, -2, "repl");
+            return 1;
+        });
+
+        // VeinCF: PERMANENT registration — DIY insert straight into the per-type AssetMap's TSet, no
+        // game function calls. Clones a real element (srcElem), swaps identity, links into the correct
+        // hash bucket via the engine's own GetTypeHash. Self-validates: GetTypeHash(oldName)&mask must
+        // equal the template's stored HashIndex, else it refuses (proves the hash matches this build).
+        // Depends only on stable struct offsets -> patch-proof. typeData offsets: Data+0x178, ArrayNum
+        // +0x180, ArrayMax+0x184, AllocFlags ptr+0x198, AllocFlags.NumBits+0x1A0, Hash ptr+0x1B8,
+        // HashSize+0x1C0. Usage:
+        //   RegisterRecipeDirect(typeDataHex, srcElemHex, oldName, oldPath, newName, newPath)
+        //     -> {ok, before, after, bucket, tmplBucket, tmplHashIdx, validated}
+        lua.register_function("RegisterRecipeDirect", [](const LuaMadeSimple::Lua& lua) -> int {
+            lua_State* L = lua.get_lua_state();
+            if (lua.get_stack_size() < 6)
+                lua.throw_error("RegisterRecipeDirect(typeData, srcElem, oldName, oldPath, newName, newPath)");
+            uintptr_t td  = (uintptr_t)strtoull(lua_tostring(L, 1), nullptr, 16);
+            uintptr_t srcElem = (uintptr_t)strtoull(lua_tostring(L, 2), nullptr, 16);
+            std::string oldName = lua_tostring(L, 3), oldPath = lua_tostring(L, 4),
+                        newName = lua_tostring(L, 5), newPath = lua_tostring(L, 6);
+            if (!td || !srcElem) lua.throw_error("RegisterRecipeDirect: bad arg");
+
+            auto r64 = [](uintptr_t a) -> uint64_t { uint64_t v = 0; veincf_safe_read_u64(reinterpret_cast<void*>(a), &v); return v; };
+            auto r32 = [&](uintptr_t a) -> uint32_t { return (uint32_t)(r64(a) & 0xFFFFFFFF); };
+
+            uint8_t*  dataPtr   = reinterpret_cast<uint8_t*>(r64(td + 0x178));
+            int32_t   arrayNum  = (int32_t)r32(td + 0x180);
+            int32_t   arrayMax  = (int32_t)r32(td + 0x184);
+            uint8_t*  allocFlags= reinterpret_cast<uint8_t*>(r64(td + 0x198));
+            uint32_t* hashTable = reinterpret_cast<uint32_t*>(r64(td + 0x1B8));
+            int32_t   hashSize  = (int32_t)r32(td + 0x1C0);
+
+            auto fnbits = [](const std::string& s) -> uint64_t {
+                Unreal::FName n(ensure_str(s.c_str()).c_str(), Unreal::FNAME_Add);
+                return *reinterpret_cast<uint64_t*>(&n);
+            };
+            auto bucketOf = [&](const std::string& s) -> int32_t {
+                Unreal::FName n(ensure_str(s.c_str()).c_str(), Unreal::FNAME_Add);
+                return (int32_t)(Unreal::GetTypeHash(n) & (uint32_t)(hashSize - 1));
+            };
+
+            int32_t tmplBucket  = bucketOf(oldName);
+            int32_t tmplHashIdx = (int32_t)r32(srcElem + 0x94);   // the template's stored bucket
+            bool validated = (tmplBucket == tmplHashIdx);
+            int32_t bucket = bucketOf(newName);
+
+            auto pushres = [&](bool ok, int32_t before, int32_t after) {
+                lua_newtable(L);
+                lua_pushboolean(L, ok?1:0);            lua_setfield(L,-2,"ok");
+                lua_pushinteger(L, before);            lua_setfield(L,-2,"before");
+                lua_pushinteger(L, after);             lua_setfield(L,-2,"after");
+                lua_pushinteger(L, bucket);            lua_setfield(L,-2,"bucket");
+                lua_pushinteger(L, tmplBucket);        lua_setfield(L,-2,"tmplBucket");
+                lua_pushinteger(L, tmplHashIdx);       lua_setfield(L,-2,"tmplHashIdx");
+                lua_pushboolean(L, validated?1:0);     lua_setfield(L,-2,"validated");
+            };
+
+            if (!dataPtr || !allocFlags || !hashTable || hashSize <= 0 || (hashSize & (hashSize-1)) != 0)
+            { Output::send(STR("[VeinCF] RegisterRecipeDirect: header read bad\n")); pushres(false, arrayNum, arrayNum); return 1; }
+            if (!validated)
+            { Output::send(STR("[VeinCF] RegisterRecipeDirect: HASH MISMATCH tmplBucket={} tmplHashIdx={} -> refusing\n"), tmplBucket, tmplHashIdx); pushres(false, arrayNum, arrayNum); return 1; }
+            if (arrayNum >= arrayMax)
+            { Output::send(STR("[VeinCF] RegisterRecipeDirect: no free slot (num={} max={}) -> realloc needed, refusing\n"), arrayNum, arrayMax); pushres(false, arrayNum, arrayNum); return 1; }
+
+            bool ok = veincf_tset_insert(
+                dataPtr, arrayNum, reinterpret_cast<uint8_t*>(srcElem),
+                fnbits(newName), fnbits(oldName), fnbits(oldPath), fnbits(newName), fnbits(newPath),
+                hashTable, bucket,
+                allocFlags, reinterpret_cast<int32_t*>(td + 0x180), reinterpret_cast<int32_t*>(td + 0x1A0));
+
+            int32_t after = (int32_t)r32(td + 0x180);
+            Output::send(STR("[VeinCF] RegisterRecipeDirect: validated={} bucket={} {} -> {} ok={}\n"),
+                (int)validated, bucket, arrayNum, after, (int)ok);
+            pushres(ok, arrayNum, after);
+            return 1;
+        });
+
+        // VeinCF: DURABLE AssetRegistry registration (twin of RegisterRecipeDirect) — the SURFACING fix.
+        // GetAllRecipes drops any entry not in FAssetRegistryState::CachedAssets (the per-entry filter =
+        // IAssetRegistry::GetAssetByObjectPath -> CachedAssets.Find). CachedAssets is a TSet<FAssetData*>
+        // (element stride 0x10) hashed by FCachedAssetKey{OuterPath=PackageName, ObjectName=AssetName}
+        // via HashCombineQuick(GetTypeHash(outer),GetTypeHash(obj)). Insert our FAssetData* (the
+        // AssetManager TSet element+0x08 — a stable by-value FAssetData). SELF-VALIDATES: a real
+        // element's recomputed key-hash must equal its stored HashIndex before any write. dryRun=1 =>
+        // validate + report only (no write). cset = the CachedAssets TSet base (AR+0x70).
+        // Usage: RegisterInAssetRegistryDirect(csetHex, fadPtrHex, outerPath, objName[, dryRun])
+        //   -> {ok, wrote, validated, bucket, num, after, max, hashSize, vSlot, vComputed, vStored}
+        lua.register_function("RegisterInAssetRegistryDirect", [](const LuaMadeSimple::Lua& lua) -> int {
+            lua_State* L = lua.get_lua_state();
+            if (lua.get_stack_size() < 3)
+                lua.throw_error("RegisterInAssetRegistryDirect(csetHex, newOuter, newName[, dryRun])");
+            uintptr_t cset = (uintptr_t)strtoull(lua_tostring(L, 1), nullptr, 16);
+            std::string outerPath = lua_tostring(L, 2), objName = lua_tostring(L, 3);
+            bool dryRun = (lua.get_stack_size() >= 4) && (lua_toboolean(L, 4) != 0);
+            if (!cset) lua.throw_error("RegisterInAssetRegistryDirect: bad arg");
+
+            auto r64 = [](uintptr_t a) -> uint64_t { uint64_t v = 0; veincf_safe_read_u64(reinterpret_cast<void*>(a), &v); return v; };
+            auto r32 = [&](uintptr_t a) -> uint32_t { return (uint32_t)(r64(a) & 0xFFFFFFFF); };
+
+            uint8_t*  dataPtr   = reinterpret_cast<uint8_t*>(r64(cset + 0x00));
+            int32_t   arrayNum  = (int32_t)r32(cset + 0x08);
+            int32_t   arrayMax  = (int32_t)r32(cset + 0x0C);
+            uint8_t*  allocFlags= reinterpret_cast<uint8_t*>(r64(cset + 0x20));
+            uint32_t* hashTable = reinterpret_cast<uint32_t*>(r64(cset + 0x40));
+            int32_t   hashSize  = (int32_t)r32(cset + 0x48);
+
+            auto hcq = [](uint32_t A, uint32_t B) -> uint32_t { return A ^ (B + 0x9e3779b9u + (A << 6) + (A >> 2)); };
+            auto hashFromBits = [](uint64_t bits) -> uint32_t { Unreal::FName n = *reinterpret_cast<Unreal::FName*>(&bits); return Unreal::GetTypeHash(n); };
+            auto hashFromStr  = [](const std::string& s) -> uint32_t { Unreal::FName n(ensure_str(s.c_str()).c_str(), Unreal::FNAME_Add); return Unreal::GetTypeHash(n); };
+
+            // SELF-VALIDATE: a real allocated element's recomputed FCachedAssetKey hash (from its
+            // FAssetData PackageName@+0x00 + AssetName@+0x10) must equal its stored HashIndex@+0x0C.
+            bool validated = false; int32_t vSlot = -1, vComputed = -1, vStored = -1;
+            uintptr_t srcFA = 0; uint64_t oldPkg = 0, oldName = 0;   // clone source = a validated real element's FAssetData
+            const int32_t STRIDE = 0x10;
+            if (dataPtr && allocFlags && hashSize > 0 && (hashSize & (hashSize - 1)) == 0) {
+                for (int32_t i = 0; i < arrayNum && i < 400; i++) {
+                    uint32_t afw = ((uint32_t*)allocFlags)[i >> 5];
+                    if (!(afw & (1u << (i & 31)))) continue;
+                    uintptr_t elem = (uintptr_t)dataPtr + (uintptr_t)i * STRIDE;
+                    uintptr_t faPtr = (uintptr_t)r64(elem + 0x00);
+                    if (!faPtr) continue;
+                    uint64_t pkgBits = r64(faPtr + 0x00);
+                    uint64_t namBits = r64(faPtr + 0x10);
+                    if (!pkgBits) continue;
+                    uint32_t hk = hcq(hashFromBits(pkgBits), hashFromBits(namBits));
+                    vSlot = i; vComputed = (int32_t)(hk & (uint32_t)(hashSize - 1)); vStored = (int32_t)r32(elem + 0x0C);
+                    if (vComputed == vStored) { validated = true; srcFA = faPtr; oldPkg = pkgBits; oldName = namBits; break; }
+                }
+            }
+
+            int32_t bucket = (hashSize > 0) ? (int32_t)(hcq(hashFromStr(outerPath), hashFromStr(objName)) & (uint32_t)(hashSize - 1)) : -1;
+
+            auto pushres = [&](bool ok, bool wrote, int32_t after) {
+                lua_newtable(L);
+                lua_pushboolean(L, ok ? 1 : 0);        lua_setfield(L, -2, "ok");
+                lua_pushboolean(L, wrote ? 1 : 0);     lua_setfield(L, -2, "wrote");
+                lua_pushboolean(L, validated ? 1 : 0); lua_setfield(L, -2, "validated");
+                lua_pushinteger(L, bucket);            lua_setfield(L, -2, "bucket");
+                lua_pushinteger(L, arrayNum);          lua_setfield(L, -2, "num");
+                lua_pushinteger(L, after);             lua_setfield(L, -2, "after");
+                lua_pushinteger(L, arrayMax);          lua_setfield(L, -2, "max");
+                lua_pushinteger(L, hashSize);          lua_setfield(L, -2, "hashSize");
+                lua_pushinteger(L, vSlot);             lua_setfield(L, -2, "vSlot");
+                lua_pushinteger(L, vComputed);         lua_setfield(L, -2, "vComputed");
+                lua_pushinteger(L, vStored);           lua_setfield(L, -2, "vStored");
+            };
+
+            if (!dataPtr || !allocFlags || !hashTable || hashSize <= 0 || (hashSize & (hashSize - 1)) != 0) {
+                Output::send(STR("[VeinCF] RegInAR: header bad (num={} max={} hashSize={})\n"), arrayNum, arrayMax, hashSize);
+                pushres(false, false, arrayNum); return 1;
+            }
+            Output::send(STR("[VeinCF] RegInAR: num={} max={} hashSize={} validated={} (vSlot={} computed={} stored={}) bucket={} dry={}\n"),
+                arrayNum, arrayMax, hashSize, (int)validated, vSlot, vComputed, vStored, bucket, (int)dryRun);
+            if (dryRun)     { pushres(true,  false, arrayNum); return 1; }
+            if (!validated) { Output::send(STR("[VeinCF] RegInAR: NOT validated -> refusing write\n")); pushres(false, false, arrayNum); return 1; }
+            if (arrayNum >= arrayMax) { Output::send(STR("[VeinCF] RegInAR: no spare (num>=max) -> refusing\n")); pushres(false, false, arrayNum); return 1; }
+
+            if (!srcFA) { Output::send(STR("[VeinCF] RegInAR: no validated src to clone -> refusing\n")); pushres(false, false, arrayNum); return 1; }
+            uint64_t newPkg = 0, newNm = 0;
+            { Unreal::FName p(ensure_str(outerPath.c_str()).c_str(), Unreal::FNAME_Add); newPkg = *reinterpret_cast<uint64_t*>(&p);
+              Unreal::FName o(ensure_str(objName.c_str()).c_str(),  Unreal::FNAME_Add); newNm  = *reinterpret_cast<uint64_t*>(&o); }
+            void* clone = nullptr;
+            bool ok = veincf_cset_clone_swap_insert(dataPtr, arrayNum, reinterpret_cast<uint8_t*>(srcFA),
+                oldPkg, newPkg, oldName, newNm, hashTable, bucket, allocFlags,
+                reinterpret_cast<int32_t*>(cset + 0x08), reinterpret_cast<int32_t*>(cset + 0x28), &clone);
+            int32_t after = (int32_t)r32(cset + 0x08);
+            Output::send(STR("[VeinCF] RegInAR: wrote ok={} cloneFAD={} num {}->{}\n"), (int)ok, (uint64_t)(uintptr_t)clone, arrayNum, after);
+            pushres(ok, ok, after); return 1;
+        });
+
+        // VeinCF: make a real runtime UPackage via the engine CreatePackage(const TCHAR*) — resolved in
+        // Lua from its "empty package name"/"named 'None'" Fatal-log anchors. UE4SS's
+        // StaticConstructObject can't (it rejects a nil outer). Lua then StaticFindObject's the new
+        // package + outers the clone to it so GetAllRecipes' resolver can resolve our runtime object.
+        // Usage: CreateRuntimePackage(createPkgAddrHex, packageName) -> ptrHex | nil
+        lua.register_function("CreateRuntimePackage", [](const LuaMadeSimple::Lua& lua) -> int {
+            lua_State* L = lua.get_lua_state();
+            if (lua.get_stack_size() < 2) lua.throw_error("CreateRuntimePackage(createPkgAddrHex, packageName)");
+            uintptr_t fn = (uintptr_t)strtoull(lua_tostring(L, 1), nullptr, 16);
+            std::string name = lua_tostring(L, 2);
+            if (!fn || name.empty()) lua.throw_error("CreateRuntimePackage: bad arg");
+            std::wstring wname(name.begin(), name.end());   // ASCII package path -> wide
+            void* pkg = veincf_call_createpackage(fn, wname.c_str());
+            Output::send(STR("[VeinCF] CreateRuntimePackage -> {}\n"), (uint64_t)(uintptr_t)pkg);
+            // return the UPackage as a usable Lua UObject (StaticFindObject can't retrieve a package by name)
+            if (pkg) LuaType::auto_construct_object(lua, static_cast<Unreal::UObject*>(pkg));
+            else lua_pushnil(L);
+            return 1;
+        });
+
         // VeinCF: Find code that references a string (ANSI or UTF-16) in the main
         // game module -> resolve a function by a unique log/ensure string it uses,
         // with no symbols. Returns {strHits=N, refs={{ref=hex, func=hex}, ...}}.
@@ -3874,6 +4514,128 @@ Overloads:
             }
             lua_setfield(L, -2, "refs");
             Output::send(STR("[VeinCF] FindCallersOf: {} call sites\n"), n);
+            return 1;
+        });
+
+        // VeinCF: EnumerateFunctions(optProbeHex) — parse the PE .pdata exception
+        // directory = the COMPLETE symbol-free list of every function in the game
+        // binary. Foundation of structural resolution: no more string-anchored
+        // sifting; iterate the full inventory and match by fingerprint. .pdata is
+        // mandatory for x64 unwinding so it survives on shipping builds.
+        // Returns {ok, base, count, pdata, textBase, textSize, samples=[{begin,end}..],
+        // probe={addr,found,index,begin,end}}. The probe is the verify-live check:
+        // feed a known fn address, confirm .pdata brackets it.
+        lua.register_function("EnumerateFunctions", [](const LuaMadeSimple::Lua& lua) -> int {
+            lua_State* L = lua.get_lua_state();
+            uintptr_t probe = 0;
+            if (lua.get_stack_size() >= 1) {
+                const char* s = lua_tostring(L, 1);
+                if (s) probe = (uintptr_t)strtoull(s, nullptr, 16);
+            }
+
+            uint8_t *base = nullptr, *tb = nullptr; size_t sz = 0, ts = 0;
+            lua_newtable(L);
+            if (!veincf_get_main_module(&base, &sz, &tb, &ts)) {
+                lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
+                Output::send(STR("[VeinCF] EnumerateFunctions: module parse FAILED\n"));
+                return 1;
+            }
+            uint8_t* pdata = nullptr; uint32_t count = 0;
+            bool okp = veincf_get_pdata(base, &pdata, &count);
+
+            char hb[32];
+            lua_pushboolean(L, okp ? 1 : 0); lua_setfield(L, -2, "ok");
+            snprintf(hb, sizeof(hb), "0x%016llX", (unsigned long long)(uintptr_t)base); lua_pushstring(L, hb); lua_setfield(L, -2, "base");
+            lua_pushinteger(L, (lua_Integer)count); lua_setfield(L, -2, "count");
+            snprintf(hb, sizeof(hb), "0x%016llX", (unsigned long long)(uintptr_t)pdata); lua_pushstring(L, hb); lua_setfield(L, -2, "pdata");
+            snprintf(hb, sizeof(hb), "0x%016llX", (unsigned long long)(uintptr_t)tb); lua_pushstring(L, hb); lua_setfield(L, -2, "textBase");
+            lua_pushinteger(L, (lua_Integer)ts); lua_setfield(L, -2, "textSize");
+
+            if (okp) {
+                // samples: first 3 function bounds (absolute) for sanity
+                lua_newtable(L); int st = lua_gettop(L);
+                for (uint32_t i = 0; i < 3 && i < count; ++i) {
+                    uint32_t b = 0, e = 0;
+                    if (!veincf_pdata_sample(pdata, i, &b, &e)) break;
+                    lua_newtable(L);
+                    snprintf(hb, sizeof(hb), "0x%016llX", (unsigned long long)((uintptr_t)base + b)); lua_pushstring(L, hb); lua_setfield(L, -2, "begin");
+                    snprintf(hb, sizeof(hb), "0x%016llX", (unsigned long long)((uintptr_t)base + e)); lua_pushstring(L, hb); lua_setfield(L, -2, "end");
+                    lua_rawseti(L, st, (lua_Integer)(i + 1));
+                }
+                lua_setfield(L, -2, "samples");
+
+                if (probe) {
+                    uint32_t pr = (uint32_t)(probe - (uintptr_t)base);
+                    uint32_t b = 0, e = 0; int idx = -1;
+                    bool found = veincf_pdata_find(pdata, count, pr, &b, &e, &idx);
+                    lua_newtable(L);
+                    snprintf(hb, sizeof(hb), "0x%016llX", (unsigned long long)probe); lua_pushstring(L, hb); lua_setfield(L, -2, "addr");
+                    lua_pushboolean(L, found ? 1 : 0); lua_setfield(L, -2, "found");
+                    if (found) {
+                        lua_pushinteger(L, (lua_Integer)idx); lua_setfield(L, -2, "index");
+                        snprintf(hb, sizeof(hb), "0x%016llX", (unsigned long long)((uintptr_t)base + b)); lua_pushstring(L, hb); lua_setfield(L, -2, "begin");
+                        snprintf(hb, sizeof(hb), "0x%016llX", (unsigned long long)((uintptr_t)base + e)); lua_pushstring(L, hb); lua_setfield(L, -2, "end");
+                    }
+                    lua_setfield(L, -2, "probe");
+                }
+            }
+            Output::send(STR("[VeinCF] EnumerateFunctions: {} functions in .pdata\n"), count);
+            return 1;
+        });
+
+        // VeinCF: FindFunctionsTouchingDisp(dispCsvHex, max) — the structural matcher.
+        // Iterate the full .pdata inventory; return every function that references ALL the
+        // given displacement constants (e.g. "0x178,0x180" = touches the per-type AssetMap).
+        // Name-free fn discovery: the prefilter that collapses 571k fns to a few candidates
+        // for Lua to disasm-inspect. Returns {ok, scanned, nDisp, matches=[{addr,size,hits}]}.
+        lua.register_function("FindFunctionsTouchingDisp", [](const LuaMadeSimple::Lua& lua) -> int {
+            lua_State* L = lua.get_lua_state();
+            if (lua.get_stack_size() < 1) lua.throw_error("FindFunctionsTouchingDisp(dispCsvHex, max)");
+            const char* csv = lua_tostring(L, 1);
+            if (!csv) lua.throw_error("P1 must be a CSV of hex displacements, e.g. '0x178,0x180'");
+            int maxResults = 64;
+            if (lua.get_stack_size() >= 2) { int m = (int)lua_tointeger(L, 2); if (m > 0) maxResults = m; }
+            if (maxResults > 256) maxResults = 256;
+
+            // parse CSV -> up to 8 displacement values (strtoull handles the 0x prefix)
+            uint32_t pats[8]; int nPat = 0;
+            const char* p = csv;
+            while (*p && nPat < 8) {
+                while (*p == ' ' || *p == ',') p++;
+                if (!*p) break;
+                char* endp = nullptr;
+                unsigned long long v = strtoull(p, &endp, 16);
+                if (endp == p) { p++; continue; }
+                pats[nPat++] = (uint32_t)v;
+                p = endp;
+            }
+            if (nPat == 0) lua.throw_error("no displacements parsed");
+
+            uint8_t *base = nullptr, *tb = nullptr; size_t sz = 0, ts = 0;
+            lua_newtable(L);
+            if (!veincf_get_main_module(&base, &sz, &tb, &ts)) { lua_pushboolean(L, 0); lua_setfield(L, -2, "ok"); return 1; }
+            uint8_t* pdata = nullptr; uint32_t count = 0;
+            if (!veincf_get_pdata(base, &pdata, &count)) { lua_pushboolean(L, 0); lua_setfield(L, -2, "ok"); return 1; }
+
+            static VeincfDispMatch matches[256];
+            int n = veincf_find_disp(base, pdata, count, pats, nPat, maxResults, matches);
+
+            lua_pushboolean(L, 1); lua_setfield(L, -2, "ok");
+            lua_pushinteger(L, (lua_Integer)count); lua_setfield(L, -2, "scanned");
+            lua_pushinteger(L, (lua_Integer)nPat);  lua_setfield(L, -2, "nDisp");
+            lua_newtable(L); int tbl = lua_gettop(L);
+            char hb[32];
+            for (int i = 0; i < n; ++i) {
+                lua_newtable(L);
+                snprintf(hb, sizeof(hb), "0x%016llX", (unsigned long long)matches[i].addr); lua_pushstring(L, hb); lua_setfield(L, -2, "addr");
+                lua_pushinteger(L, (lua_Integer)matches[i].size); lua_setfield(L, -2, "size");
+                lua_newtable(L);
+                for (int pp = 0; pp < nPat; ++pp) { lua_pushinteger(L, (lua_Integer)matches[i].hits[pp]); lua_rawseti(L, -2, pp + 1); }
+                lua_setfield(L, -2, "hits");
+                lua_rawseti(L, tbl, i + 1);
+            }
+            lua_setfield(L, -2, "matches");
+            Output::send(STR("[VeinCF] FindFunctionsTouchingDisp: {} matches of {} fns\n"), n, count);
             return 1;
         });
 
